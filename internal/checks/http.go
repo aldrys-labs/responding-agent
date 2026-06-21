@@ -41,7 +41,7 @@ func (r *Runner) runHTTP(ctx context.Context, c protocol.Check) outcome {
 		req.Header.Set(k, v)
 	}
 
-	client := &http.Client{Transport: r.httpTransport(c)}
+	client := r.httpClient(c)
 
 	start := time.Now()
 	resp, err := client.Do(req)

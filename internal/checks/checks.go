@@ -24,18 +24,18 @@ type outcome struct {
 	err     error
 }
 
-// Runner executes checks. It holds shared HTTP transports so connections are
+// Runner executes checks. It holds shared HTTP clients so connections are
 // pooled across runs; per-check timeouts are applied via context. A second
-// transport with certificate verification disabled serves checks that set
+// client whose transport skips certificate verification serves checks that set
 // InsecureSkipVerify.
 type Runner struct {
-	transport         *http.Transport
-	insecureTransport *http.Transport
+	client         *http.Client
+	insecureClient *http.Client
 }
 
 // NewRunner builds a Runner with sensible transport defaults.
 func NewRunner() *Runner {
-	newTransport := func(insecure bool) *http.Transport {
+	newClient := func(insecure bool) *http.Client {
 		t := &http.Transport{
 			MaxIdleConns:        100,
 			IdleConnTimeout:     90 * time.Second,
@@ -45,20 +45,20 @@ func NewRunner() *Runner {
 		if insecure {
 			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in per check
 		}
-		return t
+		return &http.Client{Transport: t}
 	}
 	return &Runner{
-		transport:         newTransport(false),
-		insecureTransport: newTransport(true),
+		client:         newClient(false),
+		insecureClient: newClient(true),
 	}
 }
 
-// httpTransport returns the transport to use for a check.
-func (r *Runner) httpTransport(c protocol.Check) *http.Transport {
+// httpClient returns the client to use for a check.
+func (r *Runner) httpClient(c protocol.Check) *http.Client {
 	if c.InsecureSkipVerify {
-		return r.insecureTransport
+		return r.insecureClient
 	}
-	return r.transport
+	return r.client
 }
 
 // timeout returns the effective timeout for a check.
