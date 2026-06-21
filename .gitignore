@@ -1,0 +1,19 @@
+# Build output
+/dist/
+/responding-agent
+*.exe
+
+# Go
+/vendor/
+*.test
+*.out
+coverage.*
+
+# Local config / secrets
+.env
+checks.local.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
