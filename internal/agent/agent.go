@@ -1,21 +1,27 @@
 // Package agent orchestrates the agent runtime: it loads the check
-// configuration (from a backend or a local file), schedules each check on its
-// own interval, batches the results and pushes them to the backend, and sends
-// periodic heartbeats. A config refresh reconciles the running checks against
-// the latest configuration.
+// configuration (from a backend or a local file, with an on-disk cache),
+// schedules each check on its own interval, batches the results and pushes them
+// to the backend (spooling on failure), and sends periodic heartbeats. A config
+// refresh reconciles the running checks against the latest configuration.
 package agent
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/aldrys-labs/responding-agent/internal/checks"
 	"github.com/aldrys-labs/responding-agent/internal/config"
 	"github.com/aldrys-labs/responding-agent/internal/dispatch"
+	"github.com/aldrys-labs/responding-agent/internal/health"
+	"github.com/aldrys-labs/responding-agent/internal/metrics"
 	"github.com/aldrys-labs/responding-agent/internal/protocol"
+	"github.com/aldrys-labs/responding-agent/internal/spool"
 )
 
 // Tunables for the dispatch and liveness loops.
@@ -26,25 +32,37 @@ const (
 	heartbeatPeriod   = 30 * time.Second
 	minCheckInterval  = 1 * time.Second
 	defaultCheckEvery = 30 * time.Second
+	maxStartupJitter  = 3 * time.Second
+	configCacheName   = "config-cache.json"
 )
 
-// Agent ties together the check runner, the config source and the dispatch
-// client.
+// Agent ties together the check runner, the config source, the dispatch client,
+// the result spool and the metrics.
 type Agent struct {
 	cfg      config.Config
 	version  string
 	hostname string
 	log      *slog.Logger
 
-	runner *checks.Runner
-	client *dispatch.Client // nil when dispatch is disabled (dry run)
+	runner  *checks.Runner
+	client  *dispatch.Client // nil when dispatch is disabled (dry run)
+	spool   *spool.Spool
+	metrics *metrics.Metrics
+
+	sem      chan struct{} // bounds concurrent in-flight checks
+	reloadCh chan struct{} // SIGHUP-driven config reload
+	jitter   func(time.Duration) time.Duration
 }
 
 // New builds an Agent from its runtime configuration.
-func New(cfg config.Config, version string, logger *slog.Logger) *Agent {
+func New(cfg config.Config, version string, logger *slog.Logger, m *metrics.Metrics) (*Agent, error) {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown"
+	}
+	sp, err := spool.Open(cfg.SpoolDir, cfg.SpoolMaxBatches, func() int64 { return time.Now().UnixNano() })
+	if err != nil {
+		return nil, err
 	}
 	a := &Agent{
 		cfg:      cfg,
@@ -52,30 +70,74 @@ func New(cfg config.Config, version string, logger *slog.Logger) *Agent {
 		hostname: host,
 		log:      logger,
 		runner:   checks.NewRunner(),
+		spool:    sp,
+		metrics:  m,
+		sem:      make(chan struct{}, cfg.MaxConcurrentChecks),
+		reloadCh: make(chan struct{}, 1),
+		jitter:   func(d time.Duration) time.Duration { return jitterUpTo(d) },
 	}
 	if cfg.DispatchEnabled() {
 		a.client = dispatch.NewClient(cfg.BackendURL, cfg.Token, version)
 	}
-	return a
+	a.metrics.SpoolDepth.Store(int64(sp.Depth()))
+	return a, nil
+}
+
+// Reload requests an out-of-band configuration refresh (wired to SIGHUP). It
+// never blocks: a refresh is already pending if the channel is full.
+func (a *Agent) Reload() {
+	select {
+	case a.reloadCh <- struct{}{}:
+	default:
+	}
 }
 
 // loadConfig returns the current check configuration, from the local file when
-// one is set, otherwise pulled from the backend.
-func (a *Agent) loadConfig(ctx context.Context) (protocol.ConfigResponse, error) {
+// one is set, otherwise pulled from the backend. Invalid checks are dropped.
+func (a *Agent) loadConfig(ctx context.Context) (protocol.ConfigResponse, bool, error) {
+	var (
+		cfg         protocol.ConfigResponse
+		err         error
+		fromBackend bool
+	)
 	if a.cfg.ChecksFile != "" {
-		return loadChecksFile(a.cfg.ChecksFile)
+		cfg, err = loadChecksFile(a.cfg.ChecksFile)
+	} else {
+		cfg, err = a.client.FetchConfig(ctx)
+		fromBackend = true
 	}
-	return a.client.FetchConfig(ctx)
+	if err != nil {
+		return protocol.ConfigResponse{}, false, err
+	}
+	cfg.Checks = a.validateChecks(cfg.Checks)
+	return cfg, fromBackend, nil
 }
 
-// Run drives the agent until ctx is cancelled. It starts the dispatch and
-// heartbeat loops, applies the initial configuration, then refreshes the
-// configuration on each poll tick.
+// validateChecks keeps only well-formed checks, logging the ones it drops.
+func (a *Agent) validateChecks(in []protocol.Check) []protocol.Check {
+	out := in[:0:0]
+	for _, c := range in {
+		if err := c.Validate(); err != nil {
+			a.log.Warn("skipping invalid check", "err", err)
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// Run drives the agent until ctx is cancelled. It starts the health, dispatch
+// and heartbeat loops, applies the initial configuration, then refreshes it on
+// each poll tick and on demand (SIGHUP).
 func (a *Agent) Run(ctx context.Context) error {
+	if a.cfg.HealthAddr != "" {
+		go func() { _ = health.Serve(ctx, a.cfg.HealthAddr, a.metrics, a.log) }()
+	}
+
 	results := make(chan protocol.Result, resultBufferSize)
 
-	// The dispatch loop is awaited on shutdown so the final batch is flushed
-	// before the process exits, rather than being dropped mid-flush.
+	// The dispatch loop is awaited on shutdown so the final batch is flushed (or
+	// spooled) before the process exits, rather than being dropped mid-flush.
 	var dispatchDone sync.WaitGroup
 	dispatchDone.Add(1)
 	go func() {
@@ -92,11 +154,24 @@ func (a *Agent) Run(ctx context.Context) error {
 	var genCancel context.CancelFunc
 
 	apply := func() {
-		cfg, err := a.loadConfig(ctx)
+		cfg, fromBackend, err := a.loadConfig(ctx)
 		if err != nil {
-			a.log.Error("load config failed, keeping current checks", "err", err)
-			return
+			a.metrics.ConfigFailures.Add(1)
+			if cached, ok := a.loadCachedConfig(); ok && !a.metrics.Ready() {
+				a.log.Warn("config load failed at startup, using cached config", "err", err)
+				cfg = cached
+				a.metrics.UsingCache.Store(true)
+			} else {
+				a.log.Error("load config failed, keeping current checks", "err", err)
+				return
+			}
+		} else {
+			a.metrics.UsingCache.Store(false)
+			if fromBackend {
+				a.saveCachedConfig(cfg)
+			}
 		}
+
 		if cfg.PollIntervalSeconds > 0 {
 			refresh.Reset(time.Duration(cfg.PollIntervalSeconds) * time.Second)
 		}
@@ -108,6 +183,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, chk := range cfg.Checks {
 			go a.runCheckLoop(genCtx, chk, results)
 		}
+		a.metrics.ChecksConfigured.Store(int64(len(cfg.Checks)))
+		a.metrics.ConfigReloads.Add(1)
 		a.log.Info("configuration applied", "checks", len(cfg.Checks))
 	}
 
@@ -115,8 +192,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			// Stop the running checks, then wait for the dispatch loop to drain
-			// and flush the buffered results before returning.
 			if genCancel != nil {
 				genCancel()
 			}
@@ -124,12 +199,16 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-refresh.C:
 			apply()
+		case <-a.reloadCh:
+			a.log.Info("reloading configuration on request")
+			apply()
 		}
 	}
 }
 
-// runCheckLoop runs one check immediately, then on its own interval, sending
-// each result to out until ctx is cancelled.
+// runCheckLoop runs one check after a small startup jitter, then on its own
+// interval, sending each result to out until ctx is cancelled. A concurrency
+// semaphore bounds how many checks execute at once.
 func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<- protocol.Result) {
 	interval := time.Duration(chk.IntervalSeconds) * time.Second
 	switch {
@@ -139,8 +218,25 @@ func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<-
 		interval = minCheckInterval
 	}
 
+	// Spread first runs so a large config does not stampede the network.
+	if j := a.jitter(interval); j > 0 {
+		select {
+		case <-time.After(j):
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	run := func() {
+		select {
+		case a.sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		res := a.runner.Run(ctx, chk)
+		<-a.sem
+
+		a.metrics.RecordResult(res.Status)
 		if res.Status != protocol.StatusUp {
 			a.log.Warn("check not up", "id", chk.ID, "type", chk.Type, "status", res.Status, "latencyMs", res.LatencyMs, "err", res.Error)
 		} else {
@@ -166,33 +262,39 @@ func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<-
 }
 
 // dispatchLoop batches results and flushes them to the backend by size or on a
-// timer. When dispatch is disabled it drains the channel (results are already
-// logged by the check loop).
+// timer. Undelivered batches are spooled and replayed on the next flush. When
+// dispatch is disabled it drains the channel (results are already logged).
 func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 	batch := make([]protocol.Result, 0, resultBatchSize)
 	flush := time.NewTicker(resultFlushPeriod)
 	defer flush.Stop()
 
 	send := func() {
-		if len(batch) == 0 || a.client == nil {
-			batch = batch[:0]
+		pending := batch
+		batch = make([]protocol.Result, 0, resultBatchSize)
+		if a.client == nil {
+			return // dry run: nothing to deliver
+		}
+		a.replaySpool()
+		if len(pending) == 0 {
 			return
 		}
 		sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := a.client.PostResults(sendCtx, batch); err != nil {
-			a.log.Error("post results failed, dropping batch", "count", len(batch), "err", err)
-		} else {
-			a.log.Debug("results posted", "count", len(batch))
+		if err := a.client.PostResults(sendCtx, pending); err != nil {
+			a.metrics.DispatchFailures.Add(1)
+			a.spoolBatch(pending, err)
+			return
 		}
-		batch = batch[:0]
+		a.metrics.ResultsPosted.Add(uint64(len(pending)))
+		a.log.Debug("results posted", "count", len(pending))
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain whatever results are already buffered, then flush, so a
-			// clean shutdown does not lose the last observations.
+			// Drain whatever results are buffered, then flush, so a clean
+			// shutdown does not lose the last observations.
 			for {
 				select {
 				case res := <-in:
@@ -216,6 +318,43 @@ func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 	}
 }
 
+// replaySpool tries to deliver spooled batches oldest-first. It stops at the
+// first failure (the backend is still unavailable) to preserve ordering.
+func (a *Agent) replaySpool() {
+	for {
+		b, ok := a.spool.Oldest()
+		if !ok {
+			return
+		}
+		sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := a.client.PostResults(sendCtx, b.Results)
+		cancel()
+		if err != nil {
+			a.log.Debug("spool replay paused, backend still failing", "err", err)
+			return
+		}
+		a.spool.Remove(b)
+		a.metrics.ResultsPosted.Add(uint64(len(b.Results)))
+		a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
+		a.log.Info("replayed spooled results", "count", len(b.Results))
+	}
+}
+
+// spoolBatch stores an undelivered batch for later replay.
+func (a *Agent) spoolBatch(batch []protocol.Result, cause error) {
+	dropped, err := a.spool.Add(batch)
+	if err != nil {
+		a.log.Error("post failed and spooling failed, dropping batch", "count", len(batch), "err", err, "cause", cause)
+		return
+	}
+	a.metrics.ResultsSpooled.Add(uint64(len(batch)))
+	a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
+	if dropped > 0 {
+		a.log.Warn("spool full, dropped oldest batches", "dropped", dropped)
+	}
+	a.log.Warn("post failed, spooled batch for retry", "count", len(batch), "err", cause)
+}
+
 // heartbeatLoop sends a heartbeat immediately and then on a fixed period.
 func (a *Agent) heartbeatLoop(ctx context.Context) {
 	beat := func() {
@@ -223,7 +362,9 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		defer cancel()
 		if err := a.client.Heartbeat(hbCtx, a.hostname); err != nil {
 			a.log.Warn("heartbeat failed", "err", err)
+			return
 		}
+		a.metrics.Heartbeats.Add(1)
 	}
 	beat()
 	ticker := time.NewTicker(heartbeatPeriod)
@@ -236,4 +377,58 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			beat()
 		}
 	}
+}
+
+// configCachePath returns the on-disk cache path, or "" when no spool dir is set.
+func (a *Agent) configCachePath() string {
+	if a.cfg.SpoolDir == "" {
+		return ""
+	}
+	return filepath.Join(a.cfg.SpoolDir, configCacheName)
+}
+
+func (a *Agent) saveCachedConfig(cfg protocol.ConfigResponse) {
+	path := a.configCachePath()
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		a.log.Debug("could not write config cache", "err", err)
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+func (a *Agent) loadCachedConfig() (protocol.ConfigResponse, bool) {
+	path := a.configCachePath()
+	if path == "" {
+		return protocol.ConfigResponse{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return protocol.ConfigResponse{}, false
+	}
+	var cfg protocol.ConfigResponse
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return protocol.ConfigResponse{}, false
+	}
+	cfg.Checks = a.validateChecks(cfg.Checks)
+	return cfg, true
+}
+
+// jitterUpTo returns a random duration in [0, min(d, maxStartupJitter)).
+func jitterUpTo(d time.Duration) time.Duration {
+	cap := d
+	if cap > maxStartupJitter {
+		cap = maxStartupJitter
+	}
+	if cap <= 0 {
+		return 0
+	}
+	return rand.N(cap)
 }

@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  binaries:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -36,7 +36,28 @@ jobs:
           go build -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o "dist/${out}" ./cmd/responding-agent
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          generate_release_notes: true

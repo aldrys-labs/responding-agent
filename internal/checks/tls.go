@@ -30,7 +30,10 @@ func runTLS(ctx context.Context, c protocol.Check) outcome {
 	ctx, cancel := context.WithTimeout(ctx, timeout(c))
 	defer cancel()
 
-	dialer := &tls.Dialer{Config: &tls.Config{ServerName: host}}
+	dialer := &tls.Dialer{Config: &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: c.InsecureSkipVerify, //nolint:gosec // opt-in per check
+	}}
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", target)
 	latency := time.Since(start)

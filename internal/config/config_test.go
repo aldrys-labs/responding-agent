@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestLoad(t *testing.T) {
 	tests := []struct {
@@ -87,6 +91,47 @@ func TestLoad(t *testing.T) {
 				tt.check(t, c)
 			}
 		})
+	}
+}
+
+func TestTokenFromFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("  file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RESPONDING_BACKEND_URL", "https://x.example")
+	t.Setenv("RESPONDING_AGENT_TOKEN", "inline-token")
+	t.Setenv("RESPONDING_AGENT_TOKEN_FILE", tokenPath)
+
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Token != "file-token" {
+		t.Errorf("token = %q, want trimmed file-token (file overrides inline)", c.Token)
+	}
+}
+
+func TestProductionDefaults(t *testing.T) {
+	t.Setenv("RESPONDING_CHECKS_FILE", "/tmp/checks.json")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SpoolMaxBatches != DefaultSpoolMaxBatches {
+		t.Errorf("spool max = %d, want %d", c.SpoolMaxBatches, DefaultSpoolMaxBatches)
+	}
+	if c.MaxConcurrentChecks != DefaultMaxConcurrentChecks {
+		t.Errorf("max concurrent = %d, want %d", c.MaxConcurrentChecks, DefaultMaxConcurrentChecks)
+	}
+}
+
+func TestInvalidConcurrency(t *testing.T) {
+	t.Setenv("RESPONDING_CHECKS_FILE", "/tmp/checks.json")
+	t.Setenv("RESPONDING_MAX_CONCURRENT_CHECKS", "0")
+	if _, err := Load(""); err == nil {
+		t.Fatal("expected error for non-positive concurrency")
 	}
 }
 
