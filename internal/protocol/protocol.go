@@ -3,6 +3,8 @@
 // pulled from the backend, results are pushed back. Keep JSON tags stable.
 package protocol
 
+import "fmt"
+
 // CheckType enumerates the kinds of checks an agent can run.
 type CheckType string
 
@@ -37,6 +39,11 @@ type Check struct {
 	Headers        map[string]string `json:"headers,omitempty"`
 	Body           string            `json:"body,omitempty"`
 
+	// InsecureSkipVerify disables TLS certificate verification for http and tls
+	// checks. Useful for internal services with self-signed certificates, which
+	// are common behind a firewall, the very case this agent targets.
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+
 	// Optional latency threshold above which a reachable check is reported as
 	// degraded rather than up. Zero disables it.
 	DegradedAboveMs int `json:"degradedAboveMs,omitempty"`
@@ -44,6 +51,23 @@ type Check struct {
 	// TLS-specific: report degraded when the certificate expires within this
 	// many days. Zero disables the warning.
 	TLSExpiryWarningDays int `json:"tlsExpiryWarningDays,omitempty"`
+}
+
+// Validate reports whether a check is well-formed enough to run. Invalid checks
+// from the backend are skipped (and logged) rather than crashing the agent.
+func (c Check) Validate() error {
+	if c.ID == "" {
+		return fmt.Errorf("check has no id")
+	}
+	switch c.Type {
+	case CheckHTTP, CheckTCP, CheckTLS, CheckPing:
+	default:
+		return fmt.Errorf("check %q: unknown type %q", c.ID, c.Type)
+	}
+	if c.Target == "" {
+		return fmt.Errorf("check %q: empty target", c.ID)
+	}
+	return nil
 }
 
 // ConfigResponse is what GET /api/agent/config returns.
