@@ -118,6 +118,20 @@ go build ./cmd/responding-agent
 go test ./...
 ```
 
+## Releases
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please).
+Commits on `main` follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `fix: ...` -> patch release
+- `feat: ...` -> minor release
+- `feat!: ...` or a `BREAKING CHANGE:` footer -> breaking change (kept as a minor
+  bump while the version is below 1.0)
+- `chore:` / `ci:` / `docs:` / `refactor:` / `test:` -> no release
+
+release-please keeps `CHANGELOG.md` and the version in sync and opens a release
+PR; merging it tags the version and publishes the binaries.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
