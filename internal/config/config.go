@@ -4,6 +4,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 // Defaults applied when the backend does not specify otherwise.
 const (
 	DefaultPollIntervalSeconds = 60
+	DefaultSpoolMaxBatches     = 1000
+	DefaultMaxConcurrentChecks = 64
 )
 
 // Config is the agent's own runtime configuration (how to reach the backend),
@@ -34,6 +37,22 @@ type Config struct {
 	// PollIntervalSeconds is the fallback config-refresh interval used until the
 	// backend advertises its own value.
 	PollIntervalSeconds int
+
+	// SpoolDir is where undelivered result batches and the last-good config are
+	// persisted. When empty, results are buffered in memory only (lost on
+	// restart) and the config is not cached.
+	SpoolDir string
+
+	// SpoolMaxBatches caps how many result batches are kept before the oldest
+	// are dropped.
+	SpoolMaxBatches int
+
+	// HealthAddr, when set (e.g. ":9090"), enables the local health and metrics
+	// HTTP server.
+	HealthAddr string
+
+	// MaxConcurrentChecks bounds how many checks may run at the same time.
+	MaxConcurrentChecks int
 }
 
 // Load reads the configuration from the environment. ChecksFileOverride, when
@@ -44,18 +63,50 @@ func Load(checksFileOverride string) (Config, error) {
 		Token:               os.Getenv("RESPONDING_AGENT_TOKEN"),
 		ChecksFile:          os.Getenv("RESPONDING_CHECKS_FILE"),
 		PollIntervalSeconds: DefaultPollIntervalSeconds,
+		SpoolDir:            os.Getenv("RESPONDING_SPOOL_DIR"),
+		SpoolMaxBatches:     DefaultSpoolMaxBatches,
+		HealthAddr:          os.Getenv("RESPONDING_HEALTH_ADDR"),
+		MaxConcurrentChecks: DefaultMaxConcurrentChecks,
 	}
 	if checksFileOverride != "" {
 		c.ChecksFile = checksFileOverride
 	}
-	if v := os.Getenv("RESPONDING_POLL_INTERVAL"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return Config{}, errors.New("RESPONDING_POLL_INTERVAL must be a positive integer (seconds)")
+
+	// A token file (Docker/Kubernetes secret) takes precedence over the inline
+	// token so the secret never has to live in the process environment.
+	if path := os.Getenv("RESPONDING_AGENT_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return Config{}, fmt.Errorf("read RESPONDING_AGENT_TOKEN_FILE: %w", err)
 		}
-		c.PollIntervalSeconds = n
+		c.Token = strings.TrimSpace(string(data))
+	}
+
+	if err := positiveIntEnv("RESPONDING_POLL_INTERVAL", &c.PollIntervalSeconds); err != nil {
+		return Config{}, err
+	}
+	if err := positiveIntEnv("RESPONDING_SPOOL_MAX_BATCHES", &c.SpoolMaxBatches); err != nil {
+		return Config{}, err
+	}
+	if err := positiveIntEnv("RESPONDING_MAX_CONCURRENT_CHECKS", &c.MaxConcurrentChecks); err != nil {
+		return Config{}, err
 	}
 	return c, c.Validate()
+}
+
+// positiveIntEnv overwrites *dst with the integer in the named environment
+// variable when it is set, requiring a positive value.
+func positiveIntEnv(name string, dst *int) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fmt.Errorf("%s must be a positive integer", name)
+	}
+	*dst = n
+	return nil
 }
 
 // Validate ensures the configuration can actually drive the agent.
