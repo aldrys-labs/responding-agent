@@ -18,6 +18,7 @@ import (
 	"github.com/aldrys-labs/responding-agent/internal/checks"
 	"github.com/aldrys-labs/responding-agent/internal/config"
 	"github.com/aldrys-labs/responding-agent/internal/dispatch"
+	"github.com/aldrys-labs/responding-agent/internal/fsutil"
 	"github.com/aldrys-labs/responding-agent/internal/health"
 	"github.com/aldrys-labs/responding-agent/internal/metrics"
 	"github.com/aldrys-labs/responding-agent/internal/protocol"
@@ -30,6 +31,7 @@ const (
 	resultBatchSize   = 50
 	resultFlushPeriod = 5 * time.Second
 	heartbeatPeriod   = 30 * time.Second
+	dispatchTimeout   = 30 * time.Second
 	minCheckInterval  = 1 * time.Second
 	defaultCheckEvery = 30 * time.Second
 	maxStartupJitter  = 3 * time.Second
@@ -51,7 +53,6 @@ type Agent struct {
 
 	sem      chan struct{} // bounds concurrent in-flight checks
 	reloadCh chan struct{} // SIGHUP-driven config reload
-	jitter   func(time.Duration) time.Duration
 }
 
 // New builds an Agent from its runtime configuration.
@@ -74,7 +75,6 @@ func New(cfg config.Config, version string, logger *slog.Logger, m *metrics.Metr
 		metrics:  m,
 		sem:      make(chan struct{}, cfg.MaxConcurrentChecks),
 		reloadCh: make(chan struct{}, 1),
-		jitter:   func(d time.Duration) time.Duration { return jitterUpTo(d) },
 	}
 	if cfg.DispatchEnabled() {
 		a.client = dispatch.NewClient(cfg.BackendURL, cfg.Token, version)
@@ -94,23 +94,25 @@ func (a *Agent) Reload() {
 
 // loadConfig returns the current check configuration, from the local file when
 // one is set, otherwise pulled from the backend. Invalid checks are dropped.
-func (a *Agent) loadConfig(ctx context.Context) (protocol.ConfigResponse, bool, error) {
-	var (
-		cfg         protocol.ConfigResponse
-		err         error
-		fromBackend bool
-	)
+// A config pulled from the backend is written through to the on-disk cache, so
+// caching is a property of the source rather than something the caller decides.
+func (a *Agent) loadConfig(ctx context.Context) (protocol.ConfigResponse, error) {
 	if a.cfg.ChecksFile != "" {
-		cfg, err = loadChecksFile(a.cfg.ChecksFile)
-	} else {
-		cfg, err = a.client.FetchConfig(ctx)
-		fromBackend = true
+		cfg, err := loadChecksFile(a.cfg.ChecksFile)
+		if err != nil {
+			return protocol.ConfigResponse{}, err
+		}
+		cfg.Checks = a.validateChecks(cfg.Checks)
+		return cfg, nil
 	}
+
+	cfg, err := a.client.FetchConfig(ctx)
 	if err != nil {
-		return protocol.ConfigResponse{}, false, err
+		return protocol.ConfigResponse{}, err
 	}
 	cfg.Checks = a.validateChecks(cfg.Checks)
-	return cfg, fromBackend, nil
+	a.saveCachedConfig(cfg)
+	return cfg, nil
 }
 
 // validateChecks keeps only well-formed checks, logging the ones it drops.
@@ -154,7 +156,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	var genCancel context.CancelFunc
 
 	apply := func() {
-		cfg, fromBackend, err := a.loadConfig(ctx)
+		cfg, err := a.loadConfig(ctx)
 		if err != nil {
 			a.metrics.ConfigFailures.Add(1)
 			if cached, ok := a.loadCachedConfig(); ok && !a.metrics.Ready() {
@@ -167,9 +169,6 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 		} else {
 			a.metrics.UsingCache.Store(false)
-			if fromBackend {
-				a.saveCachedConfig(cfg)
-			}
 		}
 
 		if cfg.PollIntervalSeconds > 0 {
@@ -219,7 +218,7 @@ func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<-
 	}
 
 	// Spread first runs so a large config does not stampede the network.
-	if j := a.jitter(interval); j > 0 {
+	if j := jitterUpTo(interval); j > 0 {
 		select {
 		case <-time.After(j):
 		case <-ctx.Done():
@@ -279,15 +278,20 @@ func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 		if len(pending) == 0 {
 			return
 		}
-		sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := a.client.PostResults(sendCtx, pending); err != nil {
+		if err := a.postWithTimeout(pending); err != nil {
 			a.metrics.DispatchFailures.Add(1)
 			a.spoolBatch(pending, err)
 			return
 		}
 		a.metrics.ResultsPosted.Add(uint64(len(pending)))
 		a.log.Debug("results posted", "count", len(pending))
+	}
+
+	recv := func(res protocol.Result) {
+		batch = append(batch, res)
+		if len(batch) >= resultBatchSize {
+			send()
+		}
 	}
 
 	for {
@@ -298,46 +302,48 @@ func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 			for {
 				select {
 				case res := <-in:
-					batch = append(batch, res)
-					if len(batch) >= resultBatchSize {
-						send()
-					}
+					recv(res)
 				default:
 					send()
 					return
 				}
 			}
 		case res := <-in:
-			batch = append(batch, res)
-			if len(batch) >= resultBatchSize {
-				send()
-			}
+			recv(res)
 		case <-flush.C:
 			send()
 		}
 	}
 }
 
+// postWithTimeout delivers a batch under the shared dispatch timeout.
+func (a *Agent) postWithTimeout(results []protocol.Result) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
+	defer cancel()
+	return a.client.PostResults(ctx, results)
+}
+
 // replaySpool tries to deliver spooled batches oldest-first. It stops at the
-// first failure (the backend is still unavailable) to preserve ordering.
+// first failure (the backend is still unavailable) to preserve ordering, and
+// refreshes the depth gauge once when done.
 func (a *Agent) replaySpool() {
+	if a.spool.Depth() == 0 {
+		return
+	}
 	for {
 		b, ok := a.spool.Oldest()
 		if !ok {
-			return
+			break
 		}
-		sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := a.client.PostResults(sendCtx, b.Results)
-		cancel()
-		if err != nil {
+		if err := a.postWithTimeout(b.Results); err != nil {
 			a.log.Debug("spool replay paused, backend still failing", "err", err)
-			return
+			break
 		}
 		a.spool.Remove(b)
 		a.metrics.ResultsPosted.Add(uint64(len(b.Results)))
-		a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
 		a.log.Info("replayed spooled results", "count", len(b.Results))
 	}
+	a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
 }
 
 // spoolBatch stores an undelivered batch for later replay.
@@ -396,12 +402,9 @@ func (a *Agent) saveCachedConfig(cfg protocol.ConfigResponse) {
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, 0o600); err != nil {
 		a.log.Debug("could not write config cache", "err", err)
-		return
 	}
-	_ = os.Rename(tmp, path)
 }
 
 func (a *Agent) loadCachedConfig() (protocol.ConfigResponse, bool) {
@@ -409,12 +412,8 @@ func (a *Agent) loadCachedConfig() (protocol.ConfigResponse, bool) {
 	if path == "" {
 		return protocol.ConfigResponse{}, false
 	}
-	data, err := os.ReadFile(path)
+	cfg, err := loadChecksFile(path)
 	if err != nil {
-		return protocol.ConfigResponse{}, false
-	}
-	var cfg protocol.ConfigResponse
-	if err := json.Unmarshal(data, &cfg); err != nil {
 		return protocol.ConfigResponse{}, false
 	}
 	cfg.Checks = a.validateChecks(cfg.Checks)
@@ -423,12 +422,12 @@ func (a *Agent) loadCachedConfig() (protocol.ConfigResponse, bool) {
 
 // jitterUpTo returns a random duration in [0, min(d, maxStartupJitter)).
 func jitterUpTo(d time.Duration) time.Duration {
-	cap := d
-	if cap > maxStartupJitter {
-		cap = maxStartupJitter
+	limit := d
+	if limit > maxStartupJitter {
+		limit = maxStartupJitter
 	}
-	if cap <= 0 {
+	if limit <= 0 {
 		return 0
 	}
-	return rand.N(cap)
+	return rand.N(limit)
 }
