@@ -79,7 +79,7 @@ type ConfigResponse struct {
 // Result is one observation, pushed to POST /api/agent/results (batched).
 type Result struct {
 	CheckID   string `json:"checkId"`
-	Timestamp string `json:"ts"` // RFC3339
+	Timestamp string `json:"ts"` // RFC3339, sub-second precision (RFC3339Nano)
 	Status    Status `json:"status"`
 	LatencyMs int64  `json:"latencyMs"`
 	Error     string `json:"error,omitempty"`

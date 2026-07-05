@@ -295,6 +295,34 @@ func TestEvaluateLeaf(t *testing.T) {
 	}
 }
 
+// Two runs of the same check completing within one wall second must carry
+// distinct timestamps, or the backend's (monitor, agent, ts) dedupe silently
+// drops one of them (issue #10).
+func TestResultTimestampsAreSubSecond(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := NewRunner()
+	chk := protocol.Check{ID: "ts", Type: protocol.CheckHTTP, Target: srv.URL, TimeoutMs: 2000}
+	first := r.Run(context.Background(), chk)
+	second := r.Run(context.Background(), chk)
+
+	for _, res := range []protocol.Result{first, second} {
+		ts, err := time.Parse(time.RFC3339Nano, res.Timestamp)
+		if err != nil {
+			t.Fatalf("timestamp %q does not parse as RFC3339Nano: %v", res.Timestamp, err)
+		}
+		if ts.Nanosecond() == 0 {
+			t.Errorf("timestamp %q has no sub-second component", res.Timestamp)
+		}
+	}
+	if first.Timestamp == second.Timestamp {
+		t.Errorf("both runs share timestamp %q", first.Timestamp)
+	}
+}
+
 func TestUnknownCheckType(t *testing.T) {
 	r := NewRunner()
 	got := r.Run(context.Background(), protocol.Check{ID: "x", Type: "bogus", Target: "whatever"})
