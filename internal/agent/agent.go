@@ -8,6 +8,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -28,15 +29,23 @@ import (
 
 // Tunables for the dispatch and liveness loops.
 const (
-	resultBufferSize  = 256
-	resultBatchSize   = 50
-	resultFlushPeriod = 5 * time.Second
-	heartbeatPeriod   = 30 * time.Second
-	dispatchTimeout   = 30 * time.Second
-	minCheckInterval  = 1 * time.Second
-	defaultCheckEvery = 30 * time.Second
-	maxStartupJitter  = 3 * time.Second
-	configCacheName   = "config-cache.json"
+	resultBufferSize   = 256
+	resultBatchSize    = 50
+	resultFlushPeriod  = 5 * time.Second
+	heartbeatPeriod    = 30 * time.Second
+	dispatchTimeout    = 30 * time.Second
+	dispatchBackoffMin = 5 * time.Second
+	dispatchBackoffMax = 2 * time.Minute
+	minCheckInterval   = 1 * time.Second
+	defaultCheckEvery  = 30 * time.Second
+	maxStartupJitter   = 3 * time.Second
+	configCacheName    = "config-cache.json"
+)
+
+// Sentinel causes recorded when a batch is spooled without a delivery attempt.
+var (
+	errBackingOff          = errors.New("dispatch backing off after a failure")
+	errBackendStillFailing = errors.New("backend still failing during spool replay")
 )
 
 // Agent ties together the check runner, the config source, the dispatch client,
@@ -279,7 +288,10 @@ func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<-
 		}
 		select {
 		case out <- res:
-		case <-ctx.Done():
+		default:
+			// The dispatch buffer is full (stalled backend). Spool instead of
+			// blocking: the check schedule must not depend on backend health.
+			a.spoolResult(res)
 		}
 	}
 
@@ -304,21 +316,48 @@ func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 	flush := time.NewTicker(resultFlushPeriod)
 	defer flush.Stop()
 
+	// After a delivery failure the loop backs off: until retryAt, batches are
+	// spooled immediately instead of attempting more posts. A hanging backend
+	// costs one timeout per backoff window instead of stalling every flush,
+	// so the loop keeps draining the results channel and check loops never
+	// block on a full buffer.
+	var (
+		backoff time.Duration
+		retryAt time.Time
+	)
+	fail := func(pending []protocol.Result, cause error) {
+		backoff = min(max(2*backoff, dispatchBackoffMin), dispatchBackoffMax)
+		retryAt = time.Now().Add(backoff)
+		if len(pending) > 0 {
+			a.spoolBatch(pending, cause)
+		}
+	}
+
 	send := func() {
 		pending := batch
 		batch = make([]protocol.Result, 0, resultBatchSize)
 		if a.client == nil {
 			return // dry run: nothing to deliver
 		}
-		a.replaySpool()
+		if time.Now().Before(retryAt) {
+			if len(pending) > 0 {
+				a.spoolBatch(pending, errBackingOff)
+			}
+			return
+		}
+		if !a.replaySpool() {
+			fail(pending, errBackendStillFailing)
+			return
+		}
 		if len(pending) == 0 {
 			return
 		}
 		if err := a.postWithTimeout(pending); err != nil {
 			a.metrics.DispatchFailures.Add(1)
-			a.spoolBatch(pending, err)
+			fail(pending, err)
 			return
 		}
+		backoff, retryAt = 0, time.Time{}
 		a.metrics.ResultsPosted.Add(uint64(len(pending)))
 		a.log.Debug("results posted", "count", len(pending))
 	}
@@ -361,11 +400,14 @@ func (a *Agent) postWithTimeout(results []protocol.Result) error {
 
 // replaySpool tries to deliver spooled batches oldest-first. It stops at the
 // first failure (the backend is still unavailable) to preserve ordering, and
-// refreshes the depth gauge once when done.
-func (a *Agent) replaySpool() {
+// refreshes the depth gauge once when done. It reports whether the backend
+// looked healthy: true when the spool fully drained (or was empty), false when
+// a delivery failed.
+func (a *Agent) replaySpool() bool {
 	if a.spool.Depth() == 0 {
-		return
+		return true
 	}
+	healthy := true
 	for {
 		b, ok := a.spool.Oldest()
 		if !ok {
@@ -373,6 +415,7 @@ func (a *Agent) replaySpool() {
 		}
 		if err := a.postWithTimeout(b.Results); err != nil {
 			a.log.Debug("spool replay paused, backend still failing", "err", err)
+			healthy = false
 			break
 		}
 		a.spool.Remove(b)
@@ -380,6 +423,23 @@ func (a *Agent) replaySpool() {
 		a.log.Info("replayed spooled results", "count", len(b.Results))
 	}
 	a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
+	return healthy
+}
+
+// spoolResult stores one result when the dispatch buffer is full, so a stalled
+// dispatcher never blocks a check loop.
+func (a *Agent) spoolResult(res protocol.Result) {
+	dropped, err := a.spool.Add([]protocol.Result{res})
+	if err != nil {
+		a.log.Error("dispatch buffer full and spooling failed, dropping result", "check", res.CheckID, "err", err)
+		return
+	}
+	a.metrics.ResultsSpooled.Add(1)
+	a.metrics.SpoolDepth.Store(int64(a.spool.Depth()))
+	if dropped > 0 {
+		a.log.Warn("spool full, dropped oldest batches", "dropped", dropped)
+	}
+	a.log.Warn("dispatch buffer full, spooled result", "check", res.CheckID)
 }
 
 // spoolBatch stores an undelivered batch for later replay.
