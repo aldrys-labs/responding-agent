@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,6 +68,72 @@ func TestRunCheckLoopDropsResultOfCancelledRun(t *testing.T) {
 	case res := <-results:
 		t.Fatalf("aborted run delivered a result: %+v", res)
 	default:
+	}
+}
+
+// Reconciling an unchanged config must leave running loops alone (preserving
+// their ticker phase), while changed or removed checks are restarted/stopped.
+func TestReconcile(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+	}))
+	defer srv.Close()
+	countHits := func(path string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[path]
+	}
+	waitForHit := func(path string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for countHits(path) == 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("no request on %s", path)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	a := newTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := make(chan protocol.Result, 16)
+	running := make(map[string]runningCheck)
+	chk := func(path string) protocol.Check {
+		return protocol.Check{ID: "a", Type: protocol.CheckHTTP, Target: srv.URL + path, IntervalSeconds: 300, TimeoutMs: 5000}
+	}
+
+	if started, stopped := a.reconcile(ctx, running, []protocol.Check{chk("/a")}, results); started != 1 || stopped != 0 {
+		t.Fatalf("initial reconcile: started=%d stopped=%d, want 1/0", started, stopped)
+	}
+	waitForHit("/a")
+
+	// Same spec: nothing restarts, and no immediate re-run happens (a restarted
+	// loop would probe again within the 3s startup jitter).
+	if started, stopped := a.reconcile(ctx, running, []protocol.Check{chk("/a")}, results); started != 0 || stopped != 0 {
+		t.Fatalf("unchanged reconcile: started=%d stopped=%d, want 0/0", started, stopped)
+	}
+	time.Sleep(3500 * time.Millisecond)
+	if n := countHits("/a"); n != 1 {
+		t.Fatalf("unchanged check ran %d times, want 1 (loop was restarted)", n)
+	}
+
+	// Changed spec: the old loop stops and a new one starts against the new target.
+	if started, stopped := a.reconcile(ctx, running, []protocol.Check{chk("/b")}, results); started != 1 || stopped != 1 {
+		t.Fatalf("changed reconcile: started=%d stopped=%d, want 1/1", started, stopped)
+	}
+	waitForHit("/b")
+
+	// Removed: the loop stops and the running set empties.
+	if started, stopped := a.reconcile(ctx, running, nil, results); started != 0 || stopped != 1 {
+		t.Fatalf("removal reconcile: started=%d stopped=%d, want 0/1", started, stopped)
+	}
+	if len(running) != 0 {
+		t.Fatalf("running set not empty after removal: %v", running)
 	}
 }
 
