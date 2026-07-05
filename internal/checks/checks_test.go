@@ -2,10 +2,17 @@ package checks
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,6 +135,57 @@ func TestTLSDownOnNonTLSListener(t *testing.T) {
 	}
 }
 
+// An expired certificate must be down even with InsecureSkipVerify, where the
+// handshake itself validates nothing (issue #6).
+func TestTLSExpiredCertWithInsecureSkipVerify(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		DNSNames:     []string{"localhost"},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-24 * time.Hour), // already expired
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				_ = c.(*tls.Conn).Handshake()
+				c.Close()
+			}(c)
+		}
+	}()
+
+	r := NewRunner()
+	got := r.Run(context.Background(), protocol.Check{
+		ID: "tls", Type: protocol.CheckTLS, Target: ln.Addr().String(),
+		TimeoutMs: 2000, InsecureSkipVerify: true,
+	})
+	if got.Status != protocol.StatusDown {
+		t.Errorf("status = %q, want down (err=%q)", got.Status, got.Error)
+	}
+	if !strings.Contains(got.Error, "expired") {
+		t.Errorf("error = %q, want it to mention the expiry", got.Error)
+	}
+}
+
 func TestEvaluateLeaf(t *testing.T) {
 	now := time.Date(2026, 6, 21, 0, 0, 0, 0, time.UTC)
 	latency := 5 * time.Millisecond
@@ -142,6 +200,9 @@ func TestEvaluateLeaf(t *testing.T) {
 		{"valid beyond warning window", now.Add(30 * 24 * time.Hour), 14, protocol.StatusUp},
 		{"within warning window", now.Add(5 * 24 * time.Hour), 14, protocol.StatusDegraded},
 		{"exactly outside window", now.Add(15 * 24 * time.Hour), 14, protocol.StatusUp},
+		{"expired, no warning window", now.Add(-3 * 24 * time.Hour), 0, protocol.StatusDown},
+		{"expired, with warning window", now.Add(-3 * 24 * time.Hour), 14, protocol.StatusDown},
+		{"expired this instant", now, 0, protocol.StatusDown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
