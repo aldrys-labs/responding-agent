@@ -38,10 +38,26 @@ func (r *Runner) runHTTP(ctx context.Context, c protocol.Check) outcome {
 		return outcome{status: protocol.StatusDown, err: fmt.Errorf("build request: %w", err)}
 	}
 	for k, v := range c.Headers {
+		// Go's client ignores a Host header and honors req.Host instead, so a
+		// vhost-behind-IP check needs the mapping.
+		if strings.EqualFold(k, "Host") {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 
 	client := r.httpClient(c)
+	// A check that expects a 3xx wants to evaluate the redirect itself; letting
+	// the client follow it would end on the final status and never match. The
+	// shallow copy keeps the shared transport (and its connection pool).
+	if c.ExpectedStatus >= 300 && c.ExpectedStatus < 400 {
+		noFollow := *client
+		noFollow.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		client = &noFollow
+	}
 
 	start := time.Now()
 	resp, err := client.Do(req)
