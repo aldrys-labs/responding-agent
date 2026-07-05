@@ -16,11 +16,22 @@ import (
 
 func newTestAgent(t *testing.T) *Agent {
 	t.Helper()
+	return newTestAgentWithBackend(t, "")
+}
+
+// newTestAgentWithBackend builds an agent; a non-empty backendURL enables the
+// dispatch client.
+func newTestAgentWithBackend(t *testing.T, backendURL string) *Agent {
+	t.Helper()
 	cfg := config.Config{
+		BackendURL:          backendURL,
 		SpoolDir:            t.TempDir(),
 		SpoolMaxBatches:     10,
 		MaxConcurrentChecks: 4,
 		PollIntervalSeconds: 60,
+	}
+	if backendURL != "" {
+		cfg.Token = "test-token"
 	}
 	a, err := New(cfg, "test", slog.New(slog.DiscardHandler), metrics.New(time.Now().Unix()))
 	if err != nil {
@@ -134,6 +145,111 @@ func TestReconcile(t *testing.T) {
 	}
 	if len(running) != 0 {
 		t.Fatalf("running set not empty after removal: %v", running)
+	}
+}
+
+// When the dispatch buffer is full (stalled backend), a check loop must spool
+// its result and keep its schedule instead of blocking on the channel.
+func TestCheckLoopSpoolsWhenDispatchStalled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := newTestAgent(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Unbuffered channel with no reader: the dispatcher is fully stalled.
+	results := make(chan protocol.Result)
+	chk := protocol.Check{ID: "c1", Type: protocol.CheckHTTP, Target: srv.URL, IntervalSeconds: 1, TimeoutMs: 5000}
+
+	go a.runCheckLoop(ctx, chk, results)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for a.spool.Depth() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("check result was never spooled while dispatch was stalled")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// After a failed post the dispatch loop backs off: the next batch is spooled
+// without another delivery attempt, and everything is replayed once the
+// backend recovers.
+func TestDispatchLoopBacksOffAndRecovers(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	failing := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+		if failing {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := newTestAgentWithBackend(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := make(chan protocol.Result)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.dispatchLoop(ctx, results)
+	}()
+
+	feed := func(n int) {
+		for i := 0; i < n; i++ {
+			results <- protocol.Result{CheckID: "c1", Status: protocol.StatusUp, Timestamp: "t"}
+		}
+	}
+	waitDepth := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for a.spool.Depth() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("spool depth = %d, want %d", a.spool.Depth(), want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	// First full batch: one delivery attempt fails, the batch is spooled and
+	// the loop enters backoff.
+	feed(resultBatchSize)
+	waitDepth(1)
+	mu.Lock()
+	after1 := requests
+	mu.Unlock()
+	if after1 != 1 {
+		t.Fatalf("requests after first failure = %d, want 1", after1)
+	}
+
+	// Second full batch lands inside the backoff window: spooled with no new
+	// delivery attempt.
+	feed(resultBatchSize)
+	waitDepth(2)
+	mu.Lock()
+	after2 := requests
+	failing = false
+	mu.Unlock()
+	if after2 != 1 {
+		t.Fatalf("requests during backoff = %d, want still 1", after2)
+	}
+
+	// Once the backoff expires and the backend recovers, the spool drains.
+	waitDepth(0)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch loop did not exit")
 	}
 }
 
