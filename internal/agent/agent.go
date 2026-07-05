@@ -235,6 +235,12 @@ func (a *Agent) runCheckLoop(ctx context.Context, chk protocol.Check, out chan<-
 		res := a.runner.Run(ctx, chk)
 		<-a.sem
 
+		// A cancelled generation (config refresh, shutdown) aborts the run;
+		// the result reflects the abort, not the target. Drop it.
+		if ctx.Err() != nil {
+			return
+		}
+
 		a.metrics.RecordResult(res.Status)
 		if res.Status != protocol.StatusUp {
 			a.log.Warn("check not up", "id", chk.ID, "type", chk.Type, "status", res.Status, "latencyMs", res.LatencyMs, "err", res.Error)
