@@ -39,6 +39,44 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
+			name: "scheme typo is rejected",
+			env: map[string]string{
+				"RESPONDING_BACKEND_URL": "htttps://x.example",
+				"RESPONDING_AGENT_TOKEN": "secret",
+			},
+			wantErr: true,
+		},
+		{
+			name: "plain http to a non-loopback host is rejected",
+			env: map[string]string{
+				"RESPONDING_BACKEND_URL": "http://x.example",
+				"RESPONDING_AGENT_TOKEN": "secret",
+			},
+			wantErr: true,
+		},
+		{
+			name: "plain http to localhost is allowed for development",
+			env: map[string]string{
+				"RESPONDING_BACKEND_URL": "http://localhost:8080",
+				"RESPONDING_AGENT_TOKEN": "secret",
+			},
+		},
+		{
+			name: "plain http to a loopback IP is allowed for development",
+			env: map[string]string{
+				"RESPONDING_BACKEND_URL": "http://127.0.0.1:8080",
+				"RESPONDING_AGENT_TOKEN": "secret",
+			},
+		},
+		{
+			name: "https URL without a host is rejected",
+			env: map[string]string{
+				"RESPONDING_BACKEND_URL": "https://",
+				"RESPONDING_AGENT_TOKEN": "secret",
+			},
+			wantErr: true,
+		},
+		{
 			name: "local file only is valid",
 			env:  map[string]string{"RESPONDING_CHECKS_FILE": "/tmp/checks.json"},
 			check: func(t *testing.T, c Config) {

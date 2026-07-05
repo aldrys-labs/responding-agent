@@ -5,6 +5,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -119,7 +121,46 @@ func (c Config) Validate() error {
 	if c.BackendURL != "" && c.Token == "" && c.ChecksFile == "" {
 		return errors.New("RESPONDING_AGENT_TOKEN is required when pulling config from RESPONDING_BACKEND_URL")
 	}
+	if c.BackendURL != "" {
+		if err := validateBackendURL(c.BackendURL); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// validateBackendURL rejects backend URLs the dispatch client cannot safely
+// use: anything that does not parse as an absolute http(s) URL (a scheme typo
+// would otherwise fail on every call at runtime), and plain http to a
+// non-loopback host, which would send the Bearer token in cleartext. http is
+// allowed for loopback so local development still works.
+func validateBackendURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("RESPONDING_BACKEND_URL %q is not a valid URL: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("RESPONDING_BACKEND_URL %q uses plain http, which would send the agent token in cleartext; use https (http is only allowed for localhost)", raw)
+		}
+	default:
+		return fmt.Errorf("RESPONDING_BACKEND_URL %q must start with https:// (or http:// for localhost)", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("RESPONDING_BACKEND_URL %q has no host", raw)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // DispatchEnabled reports whether results should be pushed to a backend.
