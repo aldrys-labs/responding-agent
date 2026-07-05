@@ -46,6 +46,7 @@ func Open(dir string, maxBatches int, nowNano func() int64) (*Spool, error) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create spool dir: %w", err)
 		}
+		sweepTmp(dir)
 		files, err := s.listFiles()
 		if err != nil {
 			return nil, fmt.Errorf("scan spool dir: %w", err)
@@ -53,6 +54,21 @@ func Open(dir string, maxBatches int, nowNano func() int64) (*Spool, error) {
 		s.count = len(files)
 	}
 	return s, nil
+}
+
+// sweepTmp removes orphan *.tmp files left behind by a crash mid-write, before
+// any new write could collide with them. Best-effort: a leftover tmp file is
+// only wasted space, never data loss.
+func sweepTmp(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".tmp") {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // Add appends a batch. It returns the number of batches dropped to honour the
@@ -87,7 +103,9 @@ type Batch struct {
 }
 
 // Oldest returns the oldest spooled batch and true, or a zero Batch and false
-// when the spool is empty.
+// when the spool is empty. Unreadable or corrupt batch files are dropped (or
+// skipped when they cannot be removed) so replay always reaches the oldest
+// good batch.
 func (s *Spool) Oldest() (Batch, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,20 +117,29 @@ func (s *Spool) Oldest() (Batch, bool) {
 		return Batch{Results: s.mem[0]}, true
 	}
 
-	path, ok := s.oldestFile()
-	if !ok {
+	files, err := s.listFiles()
+	if err != nil {
 		return Batch{}, false
 	}
-	data, err := os.ReadFile(path)
-	if err == nil {
-		var results []protocol.Result
-		if err = json.Unmarshal(data, &results); err == nil {
-			return Batch{Results: results, ref: path}, true
+	// Resync the count with the directory: it can drift when a corrupt file
+	// could not be removed on an earlier pass. Never let it go negative or
+	// the size cap in trimLocked stops being enforced.
+	s.count = len(files)
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var results []protocol.Result
+			if err = json.Unmarshal(data, &results); err == nil {
+				return Batch{Results: results, ref: path}, true
+			}
+		}
+		// Unreadable or corrupt: drop it and keep going. If the removal fails
+		// (permissions, read-only fs) the file stays counted, since it still
+		// occupies the spool.
+		if os.Remove(path) == nil {
+			s.count--
 		}
 	}
-	// Unreadable or corrupt file: drop it so the loop can make progress.
-	os.Remove(path)
-	s.count--
 	return Batch{}, false
 }
 
@@ -128,8 +155,7 @@ func (s *Spool) Remove(b Batch) {
 		}
 		return
 	}
-	if b.ref != "" {
-		os.Remove(b.ref)
+	if b.ref != "" && os.Remove(b.ref) == nil {
 		s.count--
 	}
 }
@@ -160,40 +186,23 @@ func (s *Spool) trimLocked() (dropped int) {
 	if err != nil {
 		return 0
 	}
-	for len(files) > s.maxBatches {
-		os.Remove(files[0])
-		files = files[1:]
-		s.count--
-		dropped++
+	// Delete oldest-first until the on-disk count meets the cap. A failed
+	// removal keeps occupying the spool and must stay counted, so only
+	// successful deletions shrink the count; the next candidate is tried
+	// instead.
+	remaining := len(files)
+	for i := 0; remaining > s.maxBatches && i < len(files); i++ {
+		if os.Remove(files[i]) == nil {
+			s.count--
+			dropped++
+			remaining--
+		}
 	}
 	return dropped
 }
 
-// oldestFile returns the lexically smallest (oldest, given zero-padded names)
-// batch file in a single pass, without sorting the whole directory.
-func (s *Spool) oldestFile() (string, bool) {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return "", false
-	}
-	min := ""
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, fileExt) {
-			continue
-		}
-		if min == "" || name < min {
-			min = name
-		}
-	}
-	if min == "" {
-		return "", false
-	}
-	return filepath.Join(s.dir, min), true
-}
-
-// listFiles returns the batch files sorted oldest-first. Used only on the cold
-// paths (Open and trim), not on every Depth/replay call.
+// listFiles returns the batch files sorted oldest-first (zero-padded names
+// sort chronologically).
 func (s *Spool) listFiles() ([]string, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
