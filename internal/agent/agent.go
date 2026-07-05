@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -153,7 +154,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	refresh := time.NewTicker(time.Duration(a.cfg.PollIntervalSeconds) * time.Second)
 	defer refresh.Stop()
 
-	var genCancel context.CancelFunc
+	running := make(map[string]runningCheck)
 
 	apply := func() {
 		cfg, err := a.loadConfig(ctx)
@@ -174,25 +175,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		if cfg.PollIntervalSeconds > 0 {
 			refresh.Reset(time.Duration(cfg.PollIntervalSeconds) * time.Second)
 		}
-		if genCancel != nil {
-			genCancel()
-		}
-		var genCtx context.Context
-		genCtx, genCancel = context.WithCancel(ctx)
-		for _, chk := range cfg.Checks {
-			go a.runCheckLoop(genCtx, chk, results)
-		}
-		a.metrics.ChecksConfigured.Store(int64(len(cfg.Checks)))
+		started, stopped := a.reconcile(ctx, running, cfg.Checks, results)
+		a.metrics.ChecksConfigured.Store(int64(len(running)))
 		a.metrics.ConfigReloads.Add(1)
-		a.log.Info("configuration applied", "checks", len(cfg.Checks))
+		a.log.Info("configuration applied", "checks", len(running), "started", started, "stopped", stopped)
 	}
 
 	apply()
 	for {
 		select {
 		case <-ctx.Done():
-			if genCancel != nil {
-				genCancel()
+			for _, rc := range running {
+				rc.cancel()
 			}
 			dispatchDone.Wait()
 			return nil
@@ -203,6 +197,42 @@ func (a *Agent) Run(ctx context.Context) error {
 			apply()
 		}
 	}
+}
+
+// runningCheck is one live check loop: the spec it was started with and the
+// cancel that stops it.
+type runningCheck struct {
+	spec   protocol.Check
+	cancel context.CancelFunc
+}
+
+// reconcile diffs the desired checks against the running set: it stops loops
+// whose check disappeared or changed, starts loops for new or changed checks,
+// and leaves unchanged checks running so their ticker phase is preserved.
+// It reports how many loops were started and stopped.
+func (a *Agent) reconcile(ctx context.Context, running map[string]runningCheck, desired []protocol.Check, out chan<- protocol.Result) (started, stopped int) {
+	want := make(map[string]protocol.Check, len(desired))
+	for _, chk := range desired {
+		want[chk.ID] = chk
+	}
+	for id, rc := range running {
+		if chk, ok := want[id]; ok && reflect.DeepEqual(chk, rc.spec) {
+			continue
+		}
+		rc.cancel()
+		delete(running, id)
+		stopped++
+	}
+	for id, chk := range want {
+		if _, ok := running[id]; ok {
+			continue
+		}
+		chkCtx, cancel := context.WithCancel(ctx)
+		running[id] = runningCheck{spec: chk, cancel: cancel}
+		go a.runCheckLoop(chkCtx, chk, out)
+		started++
+	}
+	return started, stopped
 }
 
 // runCheckLoop runs one check after a small startup jitter, then on its own
