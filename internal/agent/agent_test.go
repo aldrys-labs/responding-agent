@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,6 +251,48 @@ func TestDispatchLoopBacksOffAndRecovers(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("dispatch loop did not exit")
+	}
+}
+
+// On shutdown the dispatch loop must persist the pending batch to the spool
+// without touching the network, so a hanging backend cannot make the flush
+// outlive the SIGTERM grace period.
+func TestDispatchLoopShutdownSpoolsWithoutNetwork(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-r.Context().Done() // black-hole: never respond
+	}))
+	defer srv.Close()
+
+	a := newTestAgentWithBackend(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan protocol.Result, 8)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.dispatchLoop(ctx, results)
+	}()
+
+	for i := 0; i < 3; i++ {
+		results <- protocol.Result{CheckID: "c1", Status: protocol.StatusUp, Timestamp: "t"}
+	}
+	cancel()
+
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch loop did not exit after cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("shutdown drain took %v, want a few seconds at most", elapsed)
+	}
+	if depth := a.spool.Depth(); depth != 1 {
+		t.Fatalf("spool depth = %d, want 1 (pending batch persisted)", depth)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("backend received %d requests during shutdown, want 0", n)
 	}
 }
 

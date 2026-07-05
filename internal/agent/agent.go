@@ -46,6 +46,7 @@ const (
 var (
 	errBackingOff          = errors.New("dispatch backing off after a failure")
 	errBackendStillFailing = errors.New("backend still failing during spool replay")
+	errShuttingDown        = errors.New("agent shutting down")
 )
 
 // Agent ties together the check runner, the config source, the dispatch client,
@@ -372,14 +373,19 @@ func (a *Agent) dispatchLoop(ctx context.Context, in <-chan protocol.Result) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain whatever results are buffered, then flush, so a clean
-			// shutdown does not lose the last observations.
+			// Drain whatever results are buffered and spool them directly,
+			// skipping the network: a delivery attempt against a hanging
+			// backend could outlive the SIGTERM grace period and get the
+			// process killed with the batch still in memory. The spool is
+			// replayed on the next start, so nothing is lost.
 			for {
 				select {
 				case res := <-in:
-					recv(res)
+					batch = append(batch, res)
 				default:
-					send()
+					if a.client != nil && len(batch) > 0 {
+						a.spoolBatch(batch, errShuttingDown)
+					}
 					return
 				}
 			}
