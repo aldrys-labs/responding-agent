@@ -1,6 +1,8 @@
 package spool
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aldrys-labs/responding-agent/internal/protocol"
@@ -90,6 +92,82 @@ func TestSpoolDiskPersistsAcrossReopen(t *testing.T) {
 	b, ok := s2.Oldest()
 	if !ok || b.Results[0].CheckID != "x" {
 		t.Fatalf("reopened oldest = %+v, want x", b)
+	}
+}
+
+// A corrupt head file must be dropped and replay must reach the next good
+// batch in the same call, without stalling until the next flush tick.
+func TestSpoolDiskSkipsCorruptHead(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir, 10, counterClock())
+	s.Add(batch("good"))
+
+	// A corrupt file named to sort before the good batch.
+	corrupt := filepath.Join(dir, "00000000000000000000-0000000000"+fileExt)
+	if err := os.WriteFile(corrupt, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	b, ok := s.Oldest()
+	if !ok || b.Results[0].CheckID != "good" {
+		t.Fatalf("oldest = %+v ok=%v, want the good batch", b, ok)
+	}
+	if _, err := os.Stat(corrupt); !os.IsNotExist(err) {
+		t.Error("corrupt file was not removed")
+	}
+	if d := s.Depth(); d != 1 {
+		t.Errorf("depth = %d, want 1", d)
+	}
+}
+
+// A corrupt head file that cannot be removed (read-only dir) must not drive
+// the count negative, must stay counted, and must not hide the good batches.
+func TestSpoolDiskUnremovableCorruptHead(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir, 10, counterClock())
+	s.Add(batch("good"))
+
+	corrupt := filepath.Join(dir, "00000000000000000000-0000000000"+fileExt)
+	if err := os.WriteFile(corrupt, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	// Repeated replay passes, as the dispatch loop would do every flush tick.
+	for i := 0; i < 5; i++ {
+		b, ok := s.Oldest()
+		if !ok || b.Results[0].CheckID != "good" {
+			t.Fatalf("pass %d: oldest = %+v ok=%v, want the good batch", i, b, ok)
+		}
+	}
+	// Both files are still on disk, so both stay counted: the cap gate in
+	// trimLocked must keep working.
+	if d := s.Depth(); d != 2 {
+		t.Errorf("depth = %d, want 2 (corrupt file still occupies the spool)", d)
+	}
+}
+
+// Orphan *.tmp files from a crash mid-write are swept at Open and never
+// counted as batches.
+func TestSpoolOpenSweepsOrphanTmp(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "00000000000000000001-0000000000"+fileExt+".tmp")
+	if err := os.WriteFile(orphan, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir, 10, counterClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(orphan); !os.IsNotExist(statErr) {
+		t.Error("orphan tmp file was not swept")
+	}
+	if d := s.Depth(); d != 0 {
+		t.Errorf("depth = %d, want 0", d)
 	}
 }
 
