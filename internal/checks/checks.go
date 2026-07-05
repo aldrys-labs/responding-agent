@@ -79,7 +79,7 @@ func (r *Runner) Run(ctx context.Context, c protocol.Check) (res protocol.Result
 		if rec := recover(); rec != nil {
 			res = protocol.Result{
 				CheckID:   c.ID,
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 				Status:    protocol.StatusDown,
 				Error:     fmt.Sprintf("panic: %v", rec),
 			}
@@ -100,9 +100,11 @@ func (r *Runner) Run(ctx context.Context, c protocol.Check) (res protocol.Result
 		o = outcome{status: protocol.StatusDown, err: fmt.Errorf("unknown check type %q", c.Type)}
 	}
 
+	// Sub-second precision: the backend dedupes results on (monitor, agent, ts),
+	// so two runs completing in the same wall second must not share a timestamp.
 	res = protocol.Result{
 		CheckID:   c.ID,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		Status:    o.status,
 		LatencyMs: o.latency.Milliseconds(),
 	}
