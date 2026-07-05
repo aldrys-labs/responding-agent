@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +111,84 @@ func TestTCPCheck(t *testing.T) {
 	down := r.Run(ctx, protocol.Check{ID: "tcp-down", Type: protocol.CheckTCP, Target: "127.0.0.1:1", TimeoutMs: 500})
 	if down.Status != protocol.StatusDown {
 		t.Errorf("closed port: status = %q, want down", down.Status)
+	}
+}
+
+// A check that expects a 3xx must evaluate the redirect response itself, while
+// other checks keep following redirects (issue #7).
+func TestHTTPRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	r := NewRunner()
+	tests := []struct {
+		name string
+		chk  protocol.Check
+		want protocol.Status
+	}{
+		{
+			name: "expected 302 sees the redirect, not its destination",
+			chk:  protocol.Check{ID: "a", Type: protocol.CheckHTTP, Target: srv.URL + "/redirect", ExpectedStatus: 302, TimeoutMs: 2000},
+			want: protocol.StatusUp,
+		},
+		{
+			name: "expected 200 still follows the redirect",
+			chk:  protocol.Check{ID: "b", Type: protocol.CheckHTTP, Target: srv.URL + "/redirect", ExpectedStatus: 200, TimeoutMs: 2000},
+			want: protocol.StatusUp,
+		},
+		{
+			name: "no expected status still follows the redirect",
+			chk:  protocol.Check{ID: "c", Type: protocol.CheckHTTP, Target: srv.URL + "/redirect", TimeoutMs: 2000},
+			want: protocol.StatusUp,
+		},
+		{
+			name: "expected 301 does not match a 302",
+			chk:  protocol.Check{ID: "d", Type: protocol.CheckHTTP, Target: srv.URL + "/redirect", ExpectedStatus: 301, TimeoutMs: 2000},
+			want: protocol.StatusDown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.Run(context.Background(), tt.chk)
+			if got.Status != tt.want {
+				t.Errorf("status = %q, want %q (err=%q)", got.Status, tt.want, got.Error)
+			}
+		})
+	}
+}
+
+// A Host header must set the request's vhost, which Go's client reads from
+// req.Host rather than the header map.
+func TestHTTPHostHeader(t *testing.T) {
+	var mu sync.Mutex
+	seenHost := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenHost = r.Host
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := NewRunner()
+	got := r.Run(context.Background(), protocol.Check{
+		ID: "h", Type: protocol.CheckHTTP, Target: srv.URL, TimeoutMs: 2000,
+		Headers: map[string]string{"Host": "vhost.example"},
+	})
+	if got.Status != protocol.StatusUp {
+		t.Fatalf("status = %q, want up (err=%q)", got.Status, got.Error)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seenHost != "vhost.example" {
+		t.Errorf("server saw host %q, want %q", seenHost, "vhost.example")
 	}
 }
 
